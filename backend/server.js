@@ -95,6 +95,12 @@ app.post("/api/signup", async (req, res) => {
   }
 });
 
+app.get("/hello", async (req, res) => {
+  res.status(200).json({
+      msg: "hello, comdata",
+    });
+});
+
 // --- JWT Authentication Middleware (Verification) ---
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
