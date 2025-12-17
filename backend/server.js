@@ -39,8 +39,8 @@ app.use(
 const pool = new Pool({
   user: "postgres",
   host: "localhost",
-  database: "Admindb",
-  password: "Admin@123",
+  database: "AdminManagementSystemDB",
+  password: "CDPostgre@2525",
   port: 5432,
 });
 const JWT_SECRET = "your_super_secret_key_12345";
