@@ -38,7 +38,7 @@ app.use(
 // ---------------------------------------------
 const pool = new Pool({
   user: "postgres",
-  host: "localhost",
+  host: "82.29.167.56",
   database: "AdminManagementSystemDB",
   password: "CDPostgre@2525",
   port: 5432,
