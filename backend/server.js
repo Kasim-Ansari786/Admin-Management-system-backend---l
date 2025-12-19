@@ -16,7 +16,7 @@ const app = express();
 // Allow multiple frontend ports (8080, 8081, or any localhost port for development)
 const allowedOrigins = [
   "http://localhost:8080", 
-  "https://ams.comdata.in"
+  "https://soneadmin.comdata.in"
 ];
 
 app.use(
