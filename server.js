@@ -889,8 +889,6 @@ app.get("/api/players-agssign", authenticateToken, async (req, res) => {
     console.warn("/api/players-agssign: tenant_id missing on authenticated user", { user: req.user });
     return res.status(403).json({ error: "Forbidden: Tenant not resolved for this user." });
   }
-  // Some installations may not have a dedicated `coach_id` column on `player_details`.
-  // Select `coach_name` and provide a safe placeholder for `coach_id` to avoid SQL errors.
   const sqlQuery = `
         SELECT player_id, id, name, coach_name, ''::text AS coach_id
         FROM cd.player_details
@@ -918,97 +916,56 @@ app.get("/api/players-agssign", authenticateToken, async (req, res) => {
 app.post("/api/update-coach", authenticateToken, async (req, res) => {
   const {
     coach_name: incomingCoachName,
-    coach_id,
-    coach_code,
+    coach_id, 
     player_id,
     id,
   } = req.body || {};
+  
   const tenant_id = req.user && req.user.tenant_id;
-
-  try {
-    const safe = {
-      coach_name: incomingCoachName
-        ? String(incomingCoachName).slice(0, 100)
-        : null,
-      coach_id: coach_id ?? coach_code ?? null,
-      player_id: player_id,
-      id: id,
-      tenant_id: tenant_id,
-    };
-    console.log("[/api/update-coach] payload:", safe);
-  } catch (e) {
-    console.warn("[/api/update-coach] failed to log payload", e && e.message);
-  }
+  console.log("[/api/update-coach] Attempting update for Player:", player_id, "with Coach ID:", coach_id);
 
   if (!tenant_id) {
-    return res
-      .status(403)
-      .json({ error: "Forbidden: Tenant ID missing from token." });
+    return res.status(403).json({ error: "Forbidden: Tenant ID missing." });
   }
+  const numericId = id ? Number(id) : NaN;
+  const playerIdValue = player_id ? String(player_id) : "";
 
-  const numericId = id !== undefined && id !== null ? Number(id) : NaN;
-  if (isNaN(numericId) || numericId <= 0) {
-    return res
-      .status(400)
-      .json({ error: "Invalid or missing numeric field: id." });
+  if (isNaN(numericId) || !playerIdValue) {
+    return res.status(400).json({ error: "Missing required fields: id or player_id." });
   }
-
-  const playerIdValue =
-    player_id !== undefined && player_id !== null ? String(player_id) : "";
-  if (!playerIdValue) {
-    return res
-      .status(400)
-      .json({ error: "Missing required field: player_id." });
-  }
-
-  const effectiveCoachId = coach_id ?? coach_code ?? null;
-  const numericCoachId =
-    effectiveCoachId !== undefined && effectiveCoachId !== null
-      ? Number(effectiveCoachId)
-      : NaN;
 
   try {
+    let resolvedCoachId = coach_id;
+    let resolvedCoachName = incomingCoachName;
+
     let coachCheck;
-    if (!isNaN(numericCoachId)) {
+    if (coach_id && !isNaN(Number(coach_id))) {
       coachCheck = await pool.query(
         `SELECT coach_id, coach_name FROM cd.coaches_details WHERE coach_id = $1 AND tenant_id = $2 LIMIT 1`,
-        [numericCoachId, tenant_id]
+        [Number(coach_id), tenant_id]
       );
-    } else {
+    } else if (incomingCoachName) {
       coachCheck = await pool.query(
-        `SELECT coach_id, coach_name FROM cd.coaches_details WHERE coach_id::text = $1 AND tenant_id = $2 LIMIT 1`,
-        [String(effectiveCoachId), tenant_id]
+        `SELECT coach_id, coach_name FROM cd.coaches_details WHERE LOWER(coach_name) = LOWER($1) AND tenant_id = $2 LIMIT 1`,
+        [String(incomingCoachName), tenant_id]
       );
     }
 
-    if (coachCheck.rowCount === 0) {
-      // Try resolving by coach name (case-insensitive) as a fallback
-      if (incomingCoachName) {
-        const nameResp = await pool.query(
-          `SELECT coach_code, coach_name FROM cd.coaches_details WHERE LOWER(coach_name) = LOWER($1) AND tenant_id = $2 LIMIT 1`,
-          [String(incomingCoachName).slice(0, 100), tenant_id]
-        );
-        if (nameResp.rowCount > 0) {
-          coachCheck = nameResp;
-        }
-      }
-
-      if (coachCheck.rowCount === 0) {
-        console.warn("/api/update-coach: coach lookup failed", { effectiveCoachId, incomingCoachName, tenant_id });
-        return res
-          .status(404)
-          .json({ error: "Selected coach not found for your tenant." });
-      }
+    if (coachCheck && coachCheck.rowCount > 0) {
+      resolvedCoachId = coachCheck.rows[0].coach_id;
+      resolvedCoachName = coachCheck.rows[0].coach_name;
+    } else {
+      return res.status(404).json({ error: "Coach not found in your organization." });
     }
 
-    const resolvedCoachName = coachCheck.rows[0].coach_name;
-    const resolvedCoachId = coachCheck.rows[0].coach_id;
-
+    // Note: If this fails with "coach_code" error, you MUST check your DB triggers.
     const sqlQuery = `
         UPDATE cd.player_details
         SET coach_name = $1,
-            coach_code = $2
-        WHERE player_id = $3 AND id = $4 AND tenant_id = $5
+            coach_id = $2
+        WHERE player_id = $3 
+          AND id = $4 
+          AND tenant_id = $5
         RETURNING *;
     `;
 
@@ -1023,22 +980,19 @@ app.post("/api/update-coach", authenticateToken, async (req, res) => {
     const result = await pool.query(sqlQuery, values);
 
     if (result.rowCount === 0) {
-      return res.status(404).json({
-        message:
-          "No player record found matching the criteria for update (check IDs and tenant).",
-      });
+      return res.status(404).json({ error: "Player record not found." });
     }
 
     return res.status(200).json({
       message: "Coach assigned successfully.",
-      updatedRows: result.rowCount,
       player: result.rows[0],
     });
+
   } catch (err) {
-    console.error("Database update error (/api/update-coach):", err);
+    console.error("SQL Error Details:", err.message);
     return res.status(500).json({
-      error: "Failed to update coach assignment.",
-      details: err.message,
+      error: "Database error during assignment.",
+      details: err.message, // This helps you see if a trigger is causing the 'coach_code' error
     });
   }
 });
