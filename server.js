@@ -49,6 +49,7 @@ const pool = new Pool({
   password: "Admin@123",
   port: 5432,
 });
+
 const JWT_SECRET = "your_super_secret_key_12345";
 
 app.use(express.json());
@@ -1235,33 +1236,49 @@ app.get("/api/coach-data", authenticateToken, async (req, res) => {
   }
 
   try {
-    const queryString = sql`
-SELECT 
-    p.player_id AS id,
-    p.name,
-    p.age,
-    p.category,
-    p.status,
-    ROUND(
-        (SUM(CASE WHEN a.is_present = TRUE THEN 1 ELSE 0 END) * 100.0)
-        / NULLIF(COUNT(a.attendance_id), 0),
-        2
-    ) AS attendance
-FROM cd.player_details p
-LEFT JOIN cd.attendance_sheet a ON p.player_id = a.player_id
-INNER JOIN cd.coaches_details c ON p.coach_id = c.coach_id
-INNER JOIN cd.users_login u ON c.email = u.email
-WHERE
-    u.email = $1
-    AND u.role = 'coach'
-    AND p.active = TRUE
-GROUP BY
-    p.player_id, p.name, p.age, p.category, p.status
-ORDER BY
-    p.name;
-    `;
 
-    const result = await pool.query(queryString, [coachEmail]);
+    const queryText = `
+      SELECT
+        pd.player_id,
+        pd.name,
+        pd.age,
+        pd.status,
+
+        COALESCE(
+          ROUND(
+            (COALESCE(a.present_count, 0)::NUMERIC / NULLIF(COALESCE(a.total_count, 0), 0)) * 100,
+            1
+          ),
+          0
+        ) AS attendance_percentage
+
+      FROM cd.users_login ul
+      INNER JOIN cd.coaches_details cd
+        ON cd.email = ul.email
+      INNER JOIN cd.player_details pd
+        ON pd.coach_name = cd.coach_name
+
+      LEFT JOIN (
+        SELECT
+          player_id,
+          COUNT(*) FILTER (WHERE is_present = TRUE) AS present_count,
+          COUNT(*) AS total_count
+        FROM cd.attendance_sheet
+        GROUP BY player_id
+      ) a
+        ON a.player_id = pd.player_id
+
+      WHERE
+        ul.email = $1
+        AND ul.role = 'coach'
+        AND ul.is_active = TRUE
+        AND pd.active = TRUE
+
+      ORDER BY pd.name;
+    `;
+
+    console.log("[coach-data] Executing SQL (plain):", queryText);
+    const result = await pool.query(queryText, [coachEmail]);
     res.json({
       coach_email: coachEmail,
       players: result.rows,
@@ -2000,7 +2017,6 @@ app.delete("/api/sessions/:session_id", async (req, res) => {
 //Payment details API and code
 app.get("/api/payments", authenticateToken, async (req, res) => {
   const tenant_id = req.user?.tenant_id ?? req.user?.tenant ?? null;
-
   if (!tenant_id) {
     return res
       .status(401)
@@ -2016,6 +2032,7 @@ app.get("/api/payments", authenticateToken, async (req, res) => {
             amount_paid,
             hire_date,
             end_date,
+            payment_method, -- Changed from Payment_Method to lowercase
             status
         FROM cd.payment_details
         WHERE tenant_id = $1 AND active = TRUE
@@ -2287,8 +2304,48 @@ app.get("/api/payment/:id", async (req, res) => {
 // Update payment details API and code
 app.put("/api/payment/:id", async (req, res) => {
   const paymentId = req.params.id;
-  const { full_name, email, phone, amount_paid, hire_date, end_date, status } =
-    req.body;
+  const {
+    full_name,
+    email,
+    phone,
+    amount_paid,
+    hire_date,
+    end_date,
+    status,
+    payment_method,
+  } = req.body || {};
+
+  // Validate paymentId is a positive integer
+  const numericPaymentId = Number(paymentId);
+  if (!Number.isInteger(numericPaymentId) || numericPaymentId <= 0) {
+    return res.status(400).json({ error: 'Invalid payment ID provided.' });
+  }
+
+  // Sanitize and coerce incoming values to expected DB types
+  const sanitizedAmount =
+    amount_paid === null || amount_paid === undefined || amount_paid === ''
+      ? null
+      : (() => {
+          const n = Number(amount_paid);
+          return Number.isFinite(n) ? n : null;
+        })();
+
+  const sanitizeDate = (d) => {
+    if (!d && d !== 0) return null;
+    try {
+      // Accept YYYY-MM-DD or Date strings
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(d))) return String(d);
+      const parsed = new Date(d);
+      if (isNaN(parsed.getTime())) return null;
+      return parsed.toISOString().split('T')[0];
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const sanitizedHireDate = sanitizeDate(hire_date);
+  const sanitizedEndDate = sanitizeDate(end_date);
+
   const queryText = `
         UPDATE cd.payment_details
         SET full_name = $1,
@@ -2297,24 +2354,27 @@ app.put("/api/payment/:id", async (req, res) => {
             amount_paid = $4,
             hire_date = $5,
             end_date = $6,
-            status = $7
-        WHERE payment_id = $8
-        RETURNING *; -- RETURNING * sends the updated record back
+            status = $7,
+            payment_method = $8
+        WHERE payment_id = $9
+        RETURNING *;
     `;
 
   const queryParams = [
-    full_name,
-    email,
-    phone,
-    amount_paid,
-    hire_date,
-    end_date,
-    status,
-    paymentId,
+    full_name ?? null,
+    email ?? null,
+    phone ?? null,
+    sanitizedAmount,
+    sanitizedHireDate,
+    sanitizedEndDate,
+    status ?? null,
+    payment_method ?? null,
+    numericPaymentId,
   ];
 
   try {
-    // Use the established Postgres pool instance
+    // Log the SQL and parameters for debug purposes (remove in production)
+    console.log("Executing payment update:", { paymentId: numericPaymentId, queryParams });
     const result = await pool.query(queryText, queryParams);
     if (result.rowCount > 0) {
       res.status(200).json(result.rows[0]);
@@ -2324,13 +2384,14 @@ app.put("/api/payment/:id", async (req, res) => {
       });
     }
   } catch (err) {
-    console.error("Error executing payment update query:", err.stack);
+    console.error("Error executing payment update query:", err && err.stack ? err.stack : err);
     res.status(500).json({
-      error:
-        "An internal server error occurred while updating the payment record.",
+      error: "An internal server error occurred while updating the payment record.",
+      details: err && err.message ? err.message : String(err),
     });
   }
 });
+
 
 // pending amount and paid amount API and code
 app.get("/api/payment-summary", authenticateToken, async (req, res) => {
