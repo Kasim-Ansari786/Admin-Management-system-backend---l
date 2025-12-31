@@ -1,0 +1,11 @@
+{
+  "builds": [
+    {
+      "src": "backend/server.cjs",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "backend/server.cjs" }
+  ]
+}
